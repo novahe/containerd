@@ -47,16 +47,85 @@ type snapshotter struct {
 	name string
 	db   *DB
 	l    sync.RWMutex
+
+	commitMu        sync.Mutex
+	commitsInFlight map[string]struct{}
 }
 
 // newSnapshotter returns a new Snapshotter which namespaces the given snapshot
 // using the provided name and database.
 func newSnapshotter(db *DB, name string, sn snapshots.Snapshotter) *snapshotter {
 	return &snapshotter{
-		Snapshotter: sn,
-		name:        name,
-		db:          db,
+		Snapshotter:     sn,
+		name:            name,
+		db:              db,
+		commitsInFlight: map[string]struct{}{},
 	}
+}
+
+func commitSourceToken(namespace, key string) string {
+	return namespace + "/src/" + key
+}
+
+func commitTargetToken(namespace, name string) string {
+	return namespace + "/dst/" + name
+}
+
+func dedupeStrings(values ...string) []string {
+	uniq := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if _, ok := uniq[v]; ok {
+			continue
+		}
+		uniq[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func (s *snapshotter) reserveCommit(namespace, name, key string) (func(), error) {
+	tokens := dedupeStrings(
+		commitSourceToken(namespace, key),
+		commitTargetToken(namespace, name),
+	)
+
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+
+	for _, token := range tokens {
+		if _, ok := s.commitsInFlight[token]; ok {
+			return nil, fmt.Errorf("snapshot commit already in progress for %q: %w", key, errdefs.ErrFailedPrecondition)
+		}
+	}
+	for _, token := range tokens {
+		s.commitsInFlight[token] = struct{}{}
+	}
+
+	released := false
+	return func() {
+		s.commitMu.Lock()
+		defer s.commitMu.Unlock()
+		if released {
+			return
+		}
+		for _, token := range tokens {
+			delete(s.commitsInFlight, token)
+		}
+		released = true
+	}, nil
+}
+
+func (s *snapshotter) isCommitInFlight(namespace, key string) bool {
+	s.commitMu.Lock()
+	defer s.commitMu.Unlock()
+	if _, ok := s.commitsInFlight[commitSourceToken(namespace, key)]; ok {
+		return true
+	}
+	if _, ok := s.commitsInFlight[commitTargetToken(namespace, key)]; ok {
+		return true
+	}
+	return false
 }
 
 func createKey(id uint64, namespace, key string) string {
@@ -540,10 +609,67 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		return err
 	}
 
+	releaseCommit, err := s.reserveCommit(ns, name, key)
+	if err != nil {
+		return err
+	}
+	defer releaseCommit()
+
 	var (
-		bname string
-		rerr  error
+		bkey   string
+		bname  string
+		parent []byte
 	)
+	if err := update(ctx, s.db, func(tx *bolt.Tx) error {
+		bkt := getSnapshotterBucket(tx, ns, s.name)
+		if bkt == nil {
+			return fmt.Errorf("can not find snapshotter %q: %w",
+				s.name, errdefs.ErrNotFound)
+		}
+
+		if bkt.Bucket([]byte(name)) != nil {
+			return fmt.Errorf("snapshot %q: %w", name, errdefs.ErrAlreadyExists)
+		}
+
+		obkt := bkt.Bucket([]byte(key))
+		if obkt == nil {
+			return fmt.Errorf("snapshot %v does not exist: %w", key, errdefs.ErrNotFound)
+		}
+
+		bkey = string(obkt.Get(bucketKeyName))
+		if bkey == "" {
+			return fmt.Errorf("snapshot %q missing backend key: %w", key, errdefs.ErrNotFound)
+		}
+
+		sid, err := bkt.NextSequence()
+		if err != nil {
+			return err
+		}
+
+		bname = createKey(sid, ns, name)
+		parent = append(parent[:0], obkt.Get(bucketKeyParent)...)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	inheritedOpt := snapshots.WithLabels(snapshots.FilterInheritedLabels(base.Labels))
+	if err := s.Snapshotter.Commit(ctx, bname, bkey, inheritedOpt); err != nil {
+		if errdefs.IsNotFound(err) {
+			log.G(ctx).WithField("snapshotter", s.name).WithField("key", key).WithError(err).Error("uncommittable snapshot: missing in backend, snapshot should be removed")
+		}
+		// NOTE: Consider handling already exists here from the backend. Currently
+		// already exists from the backend may be confusing to the client since it
+		// may require the client to re-attempt from prepare. However, if handling
+		// here it is not clear what happened with the existing backend key and
+		// whether the already prepared snapshot would still be used or must be
+		// discarded. It is best that all implementations of the snapshotter
+		// interface behave the same, in which case the backend should handle the
+		// mapping of duplicates and not error.
+		return err
+	}
+
+	ts := time.Now().UTC()
 	if err := update(ctx, s.db, func(tx *bolt.Tx) error {
 		bkt := getSnapshotterBucket(tx, ns, s.name)
 		if bkt == nil {
@@ -557,8 +683,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		bbkt, err := bkt.CreateBucket([]byte(name))
 		if err != nil {
 			if err == bolt.ErrBucketExists {
-				rerr = fmt.Errorf("snapshot %q: %w", name, errdefs.ErrAlreadyExists)
-				return nil
+				return fmt.Errorf("snapshot %q: %w", name, errdefs.ErrAlreadyExists)
 			}
 			return err
 		}
@@ -568,20 +693,17 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			return fmt.Errorf("snapshot %v does not exist: %w", key, errdefs.ErrNotFound)
 		}
 
-		bkey := string(obkt.Get(bucketKeyName))
-
-		sid, err := bkt.NextSequence()
-		if err != nil {
-			return err
+		currentKey := string(obkt.Get(bucketKeyName))
+		if currentKey != bkey {
+			return fmt.Errorf("snapshot %q changed while committing: %w", key, errdefs.ErrFailedPrecondition)
 		}
 
-		nameKey := createKey(sid, ns, name)
-
-		if err := bbkt.Put(bucketKeyName, []byte(nameKey)); err != nil {
-			return err
+		currentParent := obkt.Get(bucketKeyParent)
+		if string(currentParent) != string(parent) {
+			return fmt.Errorf("snapshot %q parent changed while committing: %w", key, errdefs.ErrFailedPrecondition)
 		}
 
-		parent := obkt.Get(bucketKeyParent)
+		parent := currentParent
 		if len(parent) > 0 {
 			pbkt := bkt.Bucket(parent)
 			if pbkt == nil {
@@ -603,11 +725,14 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 				return err
 			}
 		}
-		ts := time.Now().UTC()
+
 		if err := boltutil.WriteTimestamps(bbkt, ts, ts); err != nil {
 			return err
 		}
 		if err := boltutil.WriteLabels(bbkt, base.Labels); err != nil {
+			return err
+		}
+		if err := bbkt.Put(bucketKeyName, []byte(bname)); err != nil {
 			return err
 		}
 
@@ -618,40 +743,13 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 			return err
 		}
 
-		inheritedOpt := snapshots.WithLabels(snapshots.FilterInheritedLabels(base.Labels))
-
-		// NOTE: Backend snapshotters should commit fast and reliably to
-		// prevent metadata store locking and minimizing rollbacks.
-		// This operation should be done in the transaction to minimize the
-		// risk of the committed keys becoming out of sync. If this operation
-		// succeed and the overall transaction fails then the risk of out of
-		// sync data is higher and may require manual cleanup.
-		if err := s.Snapshotter.Commit(ctx, nameKey, bkey, inheritedOpt); err != nil {
-			if errdefs.IsNotFound(err) {
-				log.G(ctx).WithField("snapshotter", s.name).WithField("key", key).WithError(err).Error("uncommittable snapshot: missing in backend, snapshot should be removed")
-			}
-			// NOTE: Consider handling already exists here from the backend. Currently
-			// already exists from the backend may be confusing to the client since it
-			// may require the client to re-attempt from prepare. However, if handling
-			// here it is not clear what happened with the existing backend key and
-			// whether the already prepared snapshot would still be used or must be
-			// discarded. It is best that all implementations of the snapshotter
-			// interface behave the same, in which case the backend should handle the
-			// mapping of duplicates and not error.
-			return err
-		}
-		bname = nameKey
-
 		return nil
 	}); err != nil {
-		if bname != "" {
-			log.G(ctx).WithField("snapshotter", s.name).WithField("key", key).WithField("bname", bname).WithError(err).Error("uncommittable snapshot: transaction failed after commit, snapshot should be removed")
-
-		}
+		log.G(ctx).WithField("snapshotter", s.name).WithField("key", key).WithField("bname", bname).WithError(err).Error("uncommittable snapshot: transaction failed after backend commit, snapshot should be removed")
 		return err
 	}
 
-	if rerr == nil && s.db.dbopts.publisher != nil {
+	if s.db.dbopts.publisher != nil {
 		if err := s.db.dbopts.publisher.Publish(ctx, "/snapshot/commit", &eventstypes.SnapshotCommit{
 			Key:         key,
 			Name:        name,
@@ -661,7 +759,7 @@ func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 		}
 	}
 
-	return rerr
+	return nil
 
 }
 
@@ -672,6 +770,9 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 	ns, err := namespaces.NamespaceRequired(ctx)
 	if err != nil {
 		return err
+	}
+	if s.isCommitInFlight(ns, key) {
+		return fmt.Errorf("snapshot %q commit in progress: %w", key, errdefs.ErrFailedPrecondition)
 	}
 
 	if err := update(ctx, s.db, func(tx *bolt.Tx) error {

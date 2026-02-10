@@ -262,6 +262,144 @@ func TestSnapshotterWithRef(t *testing.T) {
 	}
 }
 
+type blockingCommitSnapshotter struct {
+	snapshots.Snapshotter
+	started chan struct{}
+	unblock chan struct{}
+}
+
+func (s *blockingCommitSnapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+
+	<-s.unblock
+	return s.Snapshotter.Commit(ctx, name, key, opts...)
+}
+
+func TestSnapshotCommitReleasesMetadataWriteTxDuringBackendCommit(t *testing.T) {
+	started := make(chan struct{}, 1)
+	unblock := make(chan struct{})
+
+	ctx, db := testDB(t, withSnapshotter("blocking", func(root string) (snapshots.Snapshotter, error) {
+		base, err := native.NewSnapshotter(root)
+		if err != nil {
+			return nil, err
+		}
+		return &blockingCommitSnapshotter{
+			Snapshotter: base,
+			started:     started,
+			unblock:     unblock,
+		}, nil
+	}))
+	sn := db.Snapshotter("blocking")
+
+	const (
+		activeKey = "block-active"
+		nameKey   = "block-committed"
+	)
+	if _, err := sn.Prepare(ctx, activeKey, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- sn.Commit(ctx, nameKey, activeKey)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for backend commit")
+	}
+
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- db.Update(func(tx *bolt.Tx) error {
+			return nil
+		})
+	}()
+
+	select {
+	case err := <-updateDone:
+		if err != nil {
+			close(unblock)
+			<-commitDone
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		close(unblock)
+		<-commitDone
+		t.Fatal("metadata write transaction was blocked by backend commit")
+	}
+
+	close(unblock)
+	if err := <-commitDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotRemoveReturnsFailedPreconditionDuringCommit(t *testing.T) {
+	started := make(chan struct{}, 1)
+	unblock := make(chan struct{})
+
+	ctx, db := testDB(t, withSnapshotter("blocking", func(root string) (snapshots.Snapshotter, error) {
+		base, err := native.NewSnapshotter(root)
+		if err != nil {
+			return nil, err
+		}
+		return &blockingCommitSnapshotter{
+			Snapshotter: base,
+			started:     started,
+			unblock:     unblock,
+		}, nil
+	}))
+	sn := db.Snapshotter("blocking")
+
+	const (
+		activeKey = "remove-active"
+		nameKey   = "remove-committed"
+	)
+	if _, err := sn.Prepare(ctx, activeKey, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- sn.Commit(ctx, nameKey, activeKey)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for backend commit")
+	}
+
+	removeDone := make(chan error, 1)
+	go func() {
+		removeDone <- sn.Remove(ctx, activeKey)
+	}()
+
+	select {
+	case err := <-removeDone:
+		if err == nil || !errdefs.IsFailedPrecondition(err) {
+			close(unblock)
+			<-commitDone
+			t.Fatalf("expected failed precondition, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(unblock)
+		<-commitDone
+		t.Fatal("remove was blocked while commit was in progress")
+	}
+
+	close(unblock)
+	if err := <-commitDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestFilterInheritedLabels(t *testing.T) {
 	tests := []struct {
 		labels   map[string]string
