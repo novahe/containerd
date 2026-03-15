@@ -314,7 +314,11 @@ func WithConnect(address string, onClose func()) Opt {
 		if err != nil {
 			return nil, nil, err
 		}
-		client := ttrpc.NewClient(conn, ttrpc.WithOnClose(onClose))
+		// Add trace context injection interceptor for OpenTelemetry
+		client := ttrpc.NewClient(conn,
+			ttrpc.WithOnClose(onClose),
+			ttrpc.WithUnaryClientInterceptor(newTraceInterceptor()),
+		)
 		return shimapi.NewShimClient(client), conn, nil
 	}
 }

@@ -489,6 +489,9 @@ func (pc *proxyClients) getClient(address string) (*grpc.ClientConn, error) {
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
 		grpc.WithDefaultServiceConfig(retryPolicy),
+
+		// Add OpenTelemetry interceptor for trace context propagation to sandboxer
+		grpc.WithChainUnaryInterceptor(otelgrpc.UnaryClientInterceptor()),
 	}
 
 	conn, err := grpc.Dial(dialer.DialAddress(address), gopts...)
