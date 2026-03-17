@@ -261,11 +261,6 @@ func TestContainerMetricsMemory(t *testing.T) {
 			expected: &runtime.MemoryUsage{
 				Timestamp:       timestamp.UnixNano(),
 				WorkingSetBytes: &runtime.UInt64Value{Value: 500},
-				AvailableBytes:  &runtime.UInt64Value{Value: 0},
-				UsageBytes:      &runtime.UInt64Value{Value: 1000},
-				RssBytes:        &runtime.UInt64Value{Value: 10},
-				PageFaults:      &runtime.UInt64Value{Value: 11},
-				MajorPageFaults: &runtime.UInt64Value{Value: 12},
 			},
 		},
 		{
@@ -285,11 +280,6 @@ func TestContainerMetricsMemory(t *testing.T) {
 			expected: &runtime.MemoryUsage{
 				Timestamp:       timestamp.UnixNano(),
 				WorkingSetBytes: &runtime.UInt64Value{Value: 500},
-				AvailableBytes:  &runtime.UInt64Value{Value: 4500},
-				UsageBytes:      &runtime.UInt64Value{Value: 1000},
-				RssBytes:        &runtime.UInt64Value{Value: 10},
-				PageFaults:      &runtime.UInt64Value{Value: 11},
-				MajorPageFaults: &runtime.UInt64Value{Value: 12},
 			},
 		},
 		{
@@ -306,11 +296,6 @@ func TestContainerMetricsMemory(t *testing.T) {
 			expected: &runtime.MemoryUsage{
 				Timestamp:       timestamp.UnixNano(),
 				WorkingSetBytes: &runtime.UInt64Value{Value: 1000},
-				AvailableBytes:  &runtime.UInt64Value{Value: 4000},
-				UsageBytes:      &runtime.UInt64Value{Value: 1000},
-				RssBytes:        &runtime.UInt64Value{Value: 0},
-				PageFaults:      &runtime.UInt64Value{Value: 11},
-				MajorPageFaults: &runtime.UInt64Value{Value: 12},
 			},
 		},
 		{
@@ -327,11 +312,6 @@ func TestContainerMetricsMemory(t *testing.T) {
 			expected: &runtime.MemoryUsage{
 				Timestamp:       timestamp.UnixNano(),
 				WorkingSetBytes: &runtime.UInt64Value{Value: 1000},
-				AvailableBytes:  &runtime.UInt64Value{Value: 0},
-				UsageBytes:      &runtime.UInt64Value{Value: 1000},
-				RssBytes:        &runtime.UInt64Value{Value: 0},
-				PageFaults:      &runtime.UInt64Value{Value: 11},
-				MajorPageFaults: &runtime.UInt64Value{Value: 12},
 			},
 		},
 	} {

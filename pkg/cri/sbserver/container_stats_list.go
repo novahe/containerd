@@ -474,11 +474,6 @@ func (c *criService) memoryContainerStats(ID string, stats interface{}, timestam
 				WorkingSetBytes: &runtime.UInt64Value{
 					Value: workingSetBytes,
 				},
-				AvailableBytes:  &runtime.UInt64Value{Value: getAvailableBytes(metrics.Memory, workingSetBytes)},
-				UsageBytes:      &runtime.UInt64Value{Value: metrics.Memory.Usage.Usage},
-				RssBytes:        &runtime.UInt64Value{Value: metrics.Memory.TotalRSS},
-				PageFaults:      &runtime.UInt64Value{Value: metrics.Memory.TotalPgFault},
-				MajorPageFaults: &runtime.UInt64Value{Value: metrics.Memory.TotalPgMajFault},
 			}, nil
 		}
 	case *cg2.Metrics:
@@ -490,13 +485,6 @@ func (c *criService) memoryContainerStats(ID string, stats interface{}, timestam
 				WorkingSetBytes: &runtime.UInt64Value{
 					Value: workingSetBytes,
 				},
-				AvailableBytes: &runtime.UInt64Value{Value: getAvailableBytesV2(metrics.Memory, workingSetBytes)},
-				UsageBytes:     &runtime.UInt64Value{Value: metrics.Memory.Usage},
-				// Use Anon memory for RSS as cAdvisor on cgroupv2
-				// see https://github.com/google/cadvisor/blob/a9858972e75642c2b1914c8d5428e33e6392c08a/container/libcontainer/handler.go#L799
-				RssBytes:        &runtime.UInt64Value{Value: metrics.Memory.Anon},
-				PageFaults:      &runtime.UInt64Value{Value: metrics.Memory.Pgfault},
-				MajorPageFaults: &runtime.UInt64Value{Value: metrics.Memory.Pgmajfault},
 			}, nil
 		}
 	default:

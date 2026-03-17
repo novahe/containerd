@@ -19,11 +19,13 @@ package sbserver
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup1"
-	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	cg1 "github.com/containerd/cgroups/v3/cgroup1/stats"
+	cg2 "github.com/containerd/cgroups/v3/cgroup2/stats"
 	"github.com/containerd/log"
 	"github.com/containernetworking/plugins/pkg/ns"
 	"github.com/vishvananda/netlink"
@@ -72,53 +74,7 @@ func (c *criService) podSandboxStats(
 		}
 		podSandboxStats.Linux.Memory = memoryStats
 
-		if sandbox.NetNSPath != "" {
-			rxBytes, rxErrors, txBytes, txErrors := getContainerNetIO(ctx, sandbox.NetNSPath)
-			podSandboxStats.Linux.Network = &runtime.NetworkUsage{
-				DefaultInterface: &runtime.NetworkInterfaceUsage{
-					Name:     defaultIfName,
-					RxBytes:  &runtime.UInt64Value{Value: rxBytes},
-					RxErrors: &runtime.UInt64Value{Value: rxErrors},
-					TxBytes:  &runtime.UInt64Value{Value: txBytes},
-					TxErrors: &runtime.UInt64Value{Value: txErrors},
-				},
-			}
-		}
-
-		var pidCount uint64
-		for _, cntr := range c.containerStore.List() {
-			if cntr.SandboxID != sandbox.ID {
-				continue
-			}
-
-			state := cntr.Status.Get().State()
-			if state != runtime.ContainerState_CONTAINER_RUNNING {
-				continue
-			}
-
-			task, err := cntr.Container.Task(ctx, nil)
-			if err != nil {
-				return nil, err
-			}
-
-			processes, err := task.Pids(ctx)
-			if err != nil {
-				return nil, err
-			}
-			pidCount += uint64(len(processes))
-
-		}
-		podSandboxStats.Linux.Process = &runtime.ProcessUsage{
-			Timestamp:    timestamp.UnixNano(),
-			ProcessCount: &runtime.UInt64Value{Value: pidCount},
-		}
-
-		listContainerStatsRequest := &runtime.ListContainerStatsRequest{Filter: &runtime.ContainerStatsFilter{PodSandboxId: meta.ID}}
-		resp, err := c.ListContainerStats(ctx, listContainerStatsRequest)
-		if err != nil {
-			return nil, fmt.Errorf("failed to obtain container stats during podSandboxStats call: %w", err)
-		}
-		podSandboxStats.Linux.Containers = resp.GetStats()
+		
 	}
 
 	return podSandboxStats, nil
@@ -152,29 +108,59 @@ func metricsForSandbox(sandbox sandboxstore.Sandbox) (interface{}, error) {
 		return nil, fmt.Errorf("failed to get cgroup metrics for sandbox %v because cgroupPath is empty", sandbox.ID)
 	}
 
-	var statsx interface{}
 	if cgroups.Mode() == cgroups.Unified {
-		cg, err := cgroupsv2.Load(cgroupPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load sandbox cgroup: %v: %w", cgroupPath, err)
-		}
-		stats, err := cg.Stat()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get stats for cgroup: %v: %w", cgroupPath, err)
-		}
-		statsx = stats
+		// cgroup v2
+		path := filepath.Join("/sys/fs/cgroup", cgroupPath)
+
+		cpuStat, _ := readKVStats(path, "cpu.stat")
+		memoryCurrent, _ := readUint64(path, "memory.current")
+		memoryMax, _ := readUint64(path, "memory.max")
+		memoryStat, _ := readKVStats(path, "memory.stat")
+
+		return &cg2.Metrics{
+			CPU: &cg2.CPUStat{
+				UsageUsec: cpuStat["usage_usec"],
+			},
+			Memory: &cg2.MemoryStat{
+				Usage:        memoryCurrent,
+				UsageLimit:   memoryMax,
+				InactiveFile: memoryStat["inactive_file"],
+			},
+		}, nil
 
 	} else {
 		control, err := cgroup1.Load(cgroup1.StaticPath(cgroupPath))
 		if err != nil {
 			return nil, fmt.Errorf("failed to load sandbox cgroup %v: %w", cgroupPath, err)
 		}
-		stats, err := control.Stat(cgroup1.IgnoreNotExist)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get stats for cgroup %v: %w", cgroupPath, err)
-		}
-		statsx = stats
-	}
 
-	return statsx, nil
+		var cpuUsage, memoryUsage, inactiveFile uint64
+		for _, s := range control.Subsystems() {
+			if p, ok := s.(pather); ok {
+				subPath := p.Path(cgroupPath)
+				switch s.Name() {
+				case cgroup1.Cpuacct:
+					cpuUsage, _ = readUint64(subPath, "cpuacct.usage")
+				case cgroup1.Memory:
+					memoryUsage, _ = readUint64(subPath, "memory.usage_in_bytes")
+					memStat, _ := readKVStats(subPath, "memory.stat")
+					inactiveFile = memStat["total_inactive_file"]
+				}
+			}
+		}
+
+		return &cg1.Metrics{
+			CPU: &cg1.CPUStat{
+				Usage: &cg1.CPUUsage{
+					Total: cpuUsage,
+				},
+			},
+			Memory: &cg1.MemoryStat{
+				Usage: &cg1.MemoryEntry{
+					Usage: memoryUsage,
+				},
+				TotalInactiveFile: inactiveFile,
+			},
+		}, nil
+	}
 }
