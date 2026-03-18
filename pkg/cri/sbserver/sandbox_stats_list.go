@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/containerd/log"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -35,19 +36,41 @@ func (c *criService) ListPodSandboxStats(
 ) (*runtime.ListPodSandboxStatsResponse, error) {
 	sandboxes := c.sandboxesForListPodSandboxStatsRequest(r)
 
-	var errs []error
-	podSandboxStats := new(runtime.ListPodSandboxStatsResponse)
+	var (
+		errs            []error
+		mu              sync.Mutex
+		wg              sync.WaitGroup
+		podSandboxStats = new(runtime.ListPodSandboxStatsResponse)
+		semaphore       = make(chan struct{}, maxStatsConcurrency)
+	)
+
 	for _, sandbox := range sandboxes {
-		sandboxStats, err := c.podSandboxStats(ctx, sandbox)
-		switch {
-		case errdefs.IsUnavailable(err):
-			log.G(ctx).WithField("podsandboxid", sandbox.ID).Debugf("failed to get pod sandbox stats, this is likely a transient error: %v", err)
-		case err != nil:
-			errs = append(errs, fmt.Errorf("failed to decode sandbox container metrics for sandbox %q: %w", sandbox.ID, err))
-		default:
-			podSandboxStats.Stats = append(podSandboxStats.Stats, sandboxStats)
-		}
+		wg.Add(1)
+		go func(sb sandboxstore.Sandbox) {
+			defer wg.Done()
+
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
+			}
+
+			sandboxStats, err := c.podSandboxStats(ctx, sb)
+
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case errdefs.IsUnavailable(err):
+				log.G(ctx).WithField("podsandboxid", sb.ID).Debugf("failed to get pod sandbox stats, this is likely a transient error: %v", err)
+			case err != nil:
+				errs = append(errs, fmt.Errorf("failed to decode sandbox container metrics for sandbox %q: %w", sb.ID, err))
+			default:
+				podSandboxStats.Stats = append(podSandboxStats.Stats, sandboxStats)
+			}
+		}(sandbox)
 	}
+	wg.Wait()
 
 	return podSandboxStats, errors.Join(errs...)
 }

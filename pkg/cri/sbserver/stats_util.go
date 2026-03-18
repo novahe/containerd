@@ -25,6 +25,8 @@ import (
 	"strings"
 )
 
+const maxStatsConcurrency = 20
+
 type pather interface {
 	Path(path string) string
 }
