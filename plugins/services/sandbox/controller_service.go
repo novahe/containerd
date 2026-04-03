@@ -59,7 +59,6 @@ func init() {
 			} else if !errors.Is(err, plugin.ErrPluginNotFound) {
 				return nil, err
 			}
-
 			sandboxersV2, err := ic.GetByType(plugins.SandboxControllerPlugin)
 			if err == nil {
 				for name, p := range sandboxersV2 {
