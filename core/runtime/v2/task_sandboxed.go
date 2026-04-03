@@ -399,6 +399,18 @@ func (s *sandboxedTask) Exec(ctx context.Context, id string, opts runtime.ExecOp
 	}, nil
 }
 
+// Process wraps an existing exec process so sandbox metadata is updated when it is deleted.
+func (s *sandboxedTask) Process(ctx context.Context, id string) (runtime.ExecProcess, error) {
+	p, err := s.remoteTask.Process(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &sandboxedProcess{
+		ExecProcess: p,
+		task:        s,
+	}, nil
+}
+
 // sandboxedProcess wrapped exec process that is running in a sandbox.
 type sandboxedProcess struct {
 	runtime.ExecProcess
@@ -509,6 +521,7 @@ type Task struct {
 
 func (t *Task) addProcess(process Process) {
 	t.Processes = append(t.Processes, process)
+	log.L.Infof("nova added process with execID %q to task %q, total processes: %d", process.ExecID, t.TaskID, len(t.Processes))
 }
 
 func (t *Task) removeProcess(execID string) {
