@@ -35,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
 	shimclient "github.com/containerd/containerd/v2/pkg/shim"
+	"github.com/containerd/containerd/v2/pkg/timeout"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/errdefs/pkg/errgrpc"
@@ -88,7 +89,7 @@ func NewSandboxedTaskManager(ic *plugin.InitContext) (*SandboxedTaskManager, err
 	}, nil
 }
 
-func (s *SandboxedTaskManager) Create(ctx context.Context, taskID string, bundle *Bundle, opts runtime.CreateOpts) (runtime.Task, error) {
+func (s *SandboxedTaskManager) Create(ctx context.Context, taskID string, bundle *Bundle, opts runtime.CreateOpts) (_ runtime.Task, retErr error) {
 	if len(opts.SandboxID) == 0 {
 		return nil, fmt.Errorf("no sandbox id specified for task %s", taskID)
 	}
@@ -132,15 +133,51 @@ func (s *SandboxedTaskManager) Create(ctx context.Context, taskID string, bundle
 	if err != nil {
 		return nil, fmt.Errorf("failed to new sandboxed task: %w", err)
 	}
+	defer func() {
+		if retErr != nil {
+			s.cleanupFailedCreate(ctx, taskID, sandboxedTask)
+		}
+	}()
 	err = sandboxedTask.Create(ctx, bundle.Path, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create sandboxed task: %w", err)
 	}
-	s.tasks.Add(ctx, sandboxedTask)
+	if err := s.tasks.Add(ctx, sandboxedTask); err != nil {
+		return nil, err
+	}
 	return sandboxedTask, nil
 }
 
-func (s *SandboxedTaskManager) Load(ctx context.Context, sandboxID string, bundle *Bundle) error {
+func (s *SandboxedTaskManager) cleanupFailedCreate(ctx context.Context, taskID string, sandboxedTask *sandboxedTask) {
+	if sandboxedTask == nil {
+		return
+	}
+
+	dctx, cancel := timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+
+	if _, err := sandboxedTask.client.Delete(dctx, &task.DeleteRequest{ID: taskID}); err != nil {
+		if !errors.Is(err, ttrpc.ErrClosed) {
+			err = normalizeNotFoundErr(err)
+			if !errdefs.IsNotFound(err) {
+				log.G(ctx).WithField("id", taskID).WithError(err).Warn("failed to delete sandboxed task after create error")
+			}
+		}
+	}
+
+	if err := sandboxedTask.sandboxHandle.UpdateTasksExtension(dctx, func(ts *Tasks) error {
+		ts.removeTask(taskID)
+		return nil
+	}); err != nil {
+		log.G(ctx).WithField("id", taskID).WithError(err).Warn("failed to rollback sandboxed task metadata after create error")
+	}
+
+	if err := sandboxedTask.close(); err != nil {
+		log.G(ctx).WithField("id", taskID).WithError(err).Warn("failed to close sandboxed task connection after create error")
+	}
+}
+
+func (s *SandboxedTaskManager) Load(ctx context.Context, sandboxID string, bundle *Bundle) (retErr error) {
 	sb, err := s.loadSandbox(ctx, sandboxID)
 	if err != nil {
 		return fmt.Errorf("failed to get sandbox %s: %w", sandboxID, err)
@@ -156,6 +193,13 @@ func (s *SandboxedTaskManager) Load(ctx context.Context, sandboxID string, bundl
 	if err != nil {
 		return fmt.Errorf("failed to new sandboxed task: %w", err)
 	}
+	defer func() {
+		if retErr != nil {
+			if err := sandboxedTask.close(); err != nil {
+				log.G(ctx).WithField("id", bundle.ID).WithError(err).Warn("failed to close sandboxed task connection after load error")
+			}
+		}
+	}()
 	return s.tasks.Add(ctx, sandboxedTask)
 }
 
@@ -187,17 +231,20 @@ func (s *SandboxedTaskManager) Delete(ctx context.Context, taskID string) (*runt
 	if taskErr != nil {
 		log.G(ctx).WithField("id", taskID).WithError(taskErr).Debug("failed to delete task")
 		if !errors.Is(taskErr, ttrpc.ErrClosed) {
-			taskErr = errgrpc.ToNative(taskErr)
+			taskErr = normalizeNotFoundErr(taskErr)
 			if !errdefs.IsNotFound(taskErr) {
 				return nil, taskErr
 			}
 		}
 	}
 
-	updateErr := st.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
+	updateErr := st.sandboxHandle.UpdateTasksExtension(context.WithoutCancel(ctx), func(ts *Tasks) error {
 		ts.removeTask(taskID)
 		return nil
 	})
+	if updateErr != nil {
+		return nil, updateErr
+	}
 
 	if err := st.bundle.Delete(); err != nil {
 		log.G(ctx).WithField("id", taskID).WithError(err).Error("failed to delete bundle")
@@ -208,10 +255,6 @@ func (s *SandboxedTaskManager) Delete(ctx context.Context, taskID string) (*runt
 	}
 
 	s.tasks.Delete(ctx, taskID)
-
-	if updateErr != nil {
-		return nil, updateErr
-	}
 
 	if taskErr != nil {
 		return nil, errdefs.ErrNotFound
@@ -303,7 +346,8 @@ func newSandboxedTask(
 	}
 
 	conn, err := makeConnection(ctx, taskID, params, func() {
-		manager.tasks.Delete(ctx, taskID)
+		// Keep the task reachable after a connection drop so Delete can still
+		// clean up bundle and metadata through an explicit retry.
 	})
 
 	if err != nil {
@@ -393,7 +437,7 @@ func (s *sandboxedTask) Create(ctx context.Context, bundle string, opts runtime.
 	// Then call Task Create api in sandbox to create the task inside sandbox
 	if err := s.remoteTask.Create(ctx, s.bundle.Path, opts); err != nil {
 		// if it is error, we need to roll back the change of sandbox
-		if e := s.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
+		if e := s.sandboxHandle.UpdateTasksExtension(context.WithoutCancel(ctx), func(ts *Tasks) error {
 			ts.removeTask(s.id)
 			return nil
 		}); e != nil {
@@ -427,7 +471,7 @@ func (s *sandboxedTask) Exec(ctx context.Context, id string, opts runtime.ExecOp
 
 	p, err := s.remoteTask.Exec(ctx, id, opts)
 	if err != nil {
-		if removeErr := s.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
+		if removeErr := s.sandboxHandle.UpdateTasksExtension(context.WithoutCancel(ctx), func(ts *Tasks) error {
 			return ts.updateTask(s.id, func(t *Task) error {
 				t.removeProcess(id)
 				return nil
@@ -463,11 +507,14 @@ type sandboxedProcess struct {
 
 // Delete wrap the Delete of the process with sandbox update
 func (p *sandboxedProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
-	exit, err := p.ExecProcess.Delete(ctx)
-	if err != nil {
-		return nil, err
+	exit, taskErr := p.ExecProcess.Delete(ctx)
+	if taskErr != nil {
+		taskErr = normalizeNotFoundErr(taskErr)
+		if !errdefs.IsNotFound(taskErr) {
+			return nil, taskErr
+		}
 	}
-	err = p.task.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
+	err := p.task.sandboxHandle.UpdateTasksExtension(context.WithoutCancel(ctx), func(ts *Tasks) error {
 		return ts.updateTask(p.task.id, func(t *Task) error {
 			t.removeProcess(p.ID())
 			return nil
@@ -476,7 +523,24 @@ func (p *sandboxedProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 	if err != nil {
 		return nil, errgrpc.ToNative(err)
 	}
+	if taskErr != nil {
+		return nil, taskErr
+	}
 	return exit, nil
+}
+
+func normalizeNotFoundErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errdefs.IsNotFound(err) {
+		return errdefs.ErrNotFound
+	}
+	nativeErr := errgrpc.ToNative(err)
+	if errdefs.IsNotFound(nativeErr) {
+		return errdefs.ErrNotFound
+	}
+	return nativeErr
 }
 
 // UpdateTasksExtension update the extension of sandbox with the key "tasks"

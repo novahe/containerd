@@ -46,23 +46,30 @@ type ShimTaskManager struct {
 	shimManager *ShimManager
 }
 
-func (m *ShimTaskManager) Create(ctx context.Context, taskID string, bundle *Bundle, opts runtime.CreateOpts) (runtime.Task, error) {
+func (m *ShimTaskManager) Create(ctx context.Context, taskID string, bundle *Bundle, opts runtime.CreateOpts) (_ runtime.Task, retErr error) {
+	// runc ignores silently features it doesn't know about, so for things that this is
+	// problematic let's check if this runc version supports them.
+	if err := m.validateRuntimeFeatures(ctx, opts); err != nil {
+		return nil, fmt.Errorf("failed to validate OCI runtime features: %w", err)
+	}
+
 	shim, err := m.shimManager.Start(ctx, taskID, bundle, opts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start shim: %w", err)
 	}
 
+	var shimTask *shimTask
+	defer func() {
+		if retErr != nil {
+			m.cleanupFailedCreate(ctx, taskID, shim, shimTask)
+		}
+	}()
+
 	// Cast to shim task and call task service to create a new container task instance.
 	// This will not be required once shim service / client implemented.
-	shimTask, err := newShimTask(shim)
+	shimTask, err = newShimTask(shim)
 	if err != nil {
 		return nil, err
-	}
-
-	// runc ignores silently features it doesn't know about, so for things that this is
-	// problematic let's check if this runc version supports them.
-	if err := m.validateRuntimeFeatures(ctx, opts); err != nil {
-		return nil, fmt.Errorf("failed to validate OCI runtime features: %w", err)
 	}
 
 	t, err := func() (runtime.Task, error) {
@@ -88,23 +95,6 @@ func (m *ShimTaskManager) Create(ctx context.Context, taskID string, bundle *Bun
 		return t, err
 	}()
 	if err != nil {
-		// NOTE: ctx contains required namespace information.
-		m.shimManager.shims.Delete(ctx, taskID)
-
-		dctx, cancel := timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
-		defer cancel()
-
-		_, errShim := shimTask.delete(dctx, false, func(context.Context, string) {})
-		if errShim != nil {
-			if errdefs.IsDeadlineExceeded(errShim) {
-				dctx, cancel = timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
-				defer cancel()
-			}
-
-			shimTask.Shutdown(dctx)
-			shimTask.Close()
-		}
-
 		return nil, fmt.Errorf("failed to create shim task: %w", err)
 	}
 
@@ -231,6 +221,36 @@ func cleanupLeakedTaskShim(ctx context.Context, s *shimTask) error {
 	}
 
 	return errSkipShimLoad
+}
+
+func (m *ShimTaskManager) cleanupFailedCreate(ctx context.Context, taskID string, shim ShimInstance, shimTask *shimTask) {
+	if shimTask == nil {
+		dctx, cancel := timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
+		defer cancel()
+
+		if err := shim.Delete(dctx); err != nil {
+			log.G(ctx).WithField("id", taskID).WithError(err).Warn("failed to cleanup shim after create error")
+		}
+		m.shimManager.shims.Delete(dctx, taskID)
+		return
+	}
+
+	// NOTE: ctx contains required namespace information.
+	m.shimManager.shims.Delete(ctx, taskID)
+
+	dctx, cancel := timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
+	defer cancel()
+
+	_, errShim := shimTask.delete(dctx, false, func(context.Context, string) {})
+	if errShim != nil {
+		if errdefs.IsDeadlineExceeded(errShim) {
+			dctx, cancel = timeout.WithContext(context.WithoutCancel(ctx), cleanupTimeout)
+			defer cancel()
+		}
+
+		shimTask.Shutdown(dctx)
+		shimTask.Close()
+	}
 }
 
 var _ runtime.Task = &shimTask{}
