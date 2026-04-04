@@ -60,6 +60,8 @@ type SandboxedTaskManager struct {
 	sandboxStore       sandbox.Store
 	sandboxControllers map[string]sandbox.Controller
 	tasks              *runtime.NSMap[*sandboxedTask]
+	sandboxMu          sync.Mutex
+	sandboxLocks       map[string]*refMutex
 }
 
 func NewSandboxedTaskManager(ic *plugin.InitContext) (*SandboxedTaskManager, error) {
@@ -82,6 +84,7 @@ func NewSandboxedTaskManager(ic *plugin.InitContext) (*SandboxedTaskManager, err
 		sandboxStore:       sandboxStore,
 		sandboxControllers: sandboxControllers,
 		tasks:              runtime.NewNSMap[*sandboxedTask](),
+		sandboxLocks:       make(map[string]*refMutex),
 	}, nil
 }
 
@@ -223,6 +226,11 @@ func (s *SandboxedTaskManager) Delete(ctx context.Context, taskID string) (*runt
 // loadSandbox loads sandboxes created by sandbox controller,
 // so the pause container and the podsandbox is excluded.
 func (s *SandboxedTaskManager) loadSandbox(ctx context.Context, sandboxID string) (*sandboxClient, error) {
+	ns, err := namespaces.NamespaceRequired(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	sb, err := s.sandboxStore.Get(ctx, sandboxID)
 	if err != nil {
 		// If the sandbox is created in a previous version,
@@ -244,7 +252,42 @@ func (s *SandboxedTaskManager) loadSandbox(ctx context.Context, sandboxID string
 		id:         sandboxID,
 		store:      s.sandboxStore,
 		controller: sbController,
+		manager:    s,
+		ns:         ns,
 	}, nil
+}
+
+type refMutex struct {
+	sync.Mutex
+	// refs tracks active holders and queued waiters for the scoped sandbox lock.
+	refs int
+}
+
+func (s *SandboxedTaskManager) withSandboxLock(namespace, sandboxID string, fn func() error) error {
+	cacheKey := namespace + "/" + sandboxID
+
+	s.sandboxMu.Lock()
+	rm, ok := s.sandboxLocks[cacheKey]
+	if !ok {
+		rm = &refMutex{}
+		s.sandboxLocks[cacheKey] = rm
+	}
+	rm.refs++
+	s.sandboxMu.Unlock()
+
+	defer func() {
+		s.sandboxMu.Lock()
+		defer s.sandboxMu.Unlock()
+		rm.refs--
+		if rm.refs == 0 {
+			delete(s.sandboxLocks, cacheKey)
+		}
+	}()
+
+	rm.Lock()
+	defer rm.Unlock()
+
+	return fn()
 }
 
 func newSandboxedTask(
@@ -299,7 +342,8 @@ type sandboxClient struct {
 	id         string
 	store      sandbox.Store
 	controller sandbox.Controller
-	mu         sync.Mutex
+	manager    *SandboxedTaskManager
+	ns         string
 }
 
 func (s *sandboxedTask) ID() string {
@@ -437,35 +481,35 @@ func (p *sandboxedProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 
 // UpdateTasksExtension update the extension of sandbox with the key "tasks"
 func (s *sandboxClient) UpdateTasksExtension(ctx context.Context, update func(ts *Tasks) error) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var tasks Tasks
-	sb, err := s.store.Get(ctx, s.id)
-	if err != nil {
-		return err
-	}
-	err = sb.GetExtension(TasksKey, &tasks)
-	if err != nil && !errdefs.IsNotFound(err) {
-		return err
-	}
-	if err = update(&tasks); err != nil {
-		return err
-	}
-	if err = sb.AddExtension(TasksKey, &tasks); err != nil {
-		return err
-	}
-	old, err := s.store.Update(ctx, sb, "extensions."+TasksKey)
-	if err != nil {
-		return err
-	}
-	if err := s.controller.Update(ctx, sb.ID, sb, "extensions."+TasksKey); err != nil {
-		// Rollback the change in sandbox store if controller update failed
-		if _, err := s.store.Update(ctx, old, "extensions."+TasksKey); err != nil {
-			log.G(ctx).Warnf("failed to rollback when update tasks of sandbox %s extensions: %v", s.id, err)
+	return s.manager.withSandboxLock(s.ns, s.id, func() error {
+		var tasks Tasks
+		sb, err := s.store.Get(ctx, s.id)
+		if err != nil {
+			return err
 		}
-		return err
-	}
-	return nil
+		err = sb.GetExtension(TasksKey, &tasks)
+		if err != nil && !errdefs.IsNotFound(err) {
+			return err
+		}
+		if err = update(&tasks); err != nil {
+			return err
+		}
+		if err = sb.AddExtension(TasksKey, &tasks); err != nil {
+			return err
+		}
+		old, err := s.store.Update(ctx, sb, "extensions."+TasksKey)
+		if err != nil {
+			return err
+		}
+		if err := s.controller.Update(ctx, sb.ID, sb, "extensions."+TasksKey); err != nil {
+			// Rollback the change in sandbox store if controller update failed
+			if _, err := s.store.Update(ctx, old, "extensions."+TasksKey); err != nil {
+				log.G(ctx).Warnf("failed to rollback when update tasks of sandbox %s extensions: %v", s.id, err)
+			}
+			return err
+		}
+		return nil
+	})
 }
 
 // Tasks is the task information list that is stored in sandbox metadata
