@@ -34,6 +34,10 @@ import (
 	shimclient "github.com/containerd/containerd/v2/pkg/shim"
 )
 
+const shimDialTimeout = 5 * time.Second
+
+var shimReconnectDialer = shimclient.AnonReconnectDialer
+
 // makeConnection creates a new TTRPC or GRPC connection object from address.
 // address can be either a socket path for TTRPC or JSON serialized BootstrapParams.
 func makeConnection(ctx context.Context, id string, params shimclient.BootstrapParams, onClose func()) (_ io.Closer, retErr error) {
@@ -45,7 +49,10 @@ func makeConnection(ctx context.Context, id string, params shimclient.BootstrapP
 
 	switch strings.ToLower(params.Protocol) {
 	case "ttrpc":
-		conn, err := shimclient.Connect(params.Address, shimclient.AnonReconnectDialer)
+		dctx, cancel := context.WithTimeout(ctx, shimDialTimeout)
+		defer cancel()
+
+		conn, err := dialShimAddress(dctx, params.Address)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TTRPC connection: %w", err)
 		}
@@ -138,5 +145,35 @@ func (gc *grpcConn) UserOnCloseWait(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func dialShimAddress(ctx context.Context, address string) (net.Conn, error) {
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+
+	resultC := make(chan dialResult, 1)
+	go func() {
+		timeout := time.Duration(0)
+		if deadline, ok := ctx.Deadline(); ok {
+			timeout = time.Until(deadline)
+		}
+		conn, err := shimReconnectDialer(address, timeout)
+		resultC <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case result := <-resultC:
+		return result.conn, result.err
+	case <-ctx.Done():
+		go func() {
+			result := <-resultC
+			if result.conn != nil {
+				result.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("dial %s: %w", address, ctx.Err())
 	}
 }

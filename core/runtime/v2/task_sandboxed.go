@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containerd/containerd/api/runtime/task/v3"
 	"github.com/containerd/containerd/api/types"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/containerd/v2/pkg/protobuf"
+	ptypes "github.com/containerd/containerd/v2/pkg/protobuf/types"
 	shimclient "github.com/containerd/containerd/v2/pkg/shim"
 	"github.com/containerd/containerd/v2/plugins"
 	"github.com/containerd/errdefs"
@@ -47,7 +49,9 @@ import (
 
 const (
 	// TasksKey is the key used for storing tasks information in the sandbox extensions
-	TasksKey = "tasks"
+	TasksKey         = "tasks"
+	taskStateTimeout = 5 * time.Second
+	taskStatsTimeout = 5 * time.Second
 )
 
 func init() {
@@ -317,6 +321,20 @@ func (s *sandboxedTask) close() error {
 	return s.connection.Close()
 }
 
+func (s *sandboxedTask) State(ctx context.Context) (runtime.State, error) {
+	ctx, cancel := withRequestTimeout(ctx, taskStateTimeout)
+	defer cancel()
+
+	return s.remoteTask.State(ctx)
+}
+
+func (s *sandboxedTask) Stats(ctx context.Context) (*ptypes.Any, error) {
+	ctx, cancel := withRequestTimeout(ctx, taskStatsTimeout)
+	defer cancel()
+
+	return s.remoteTask.Stats(ctx)
+}
+
 // Create wrap the Create API call of task with update of the sandbox extension
 func (s *sandboxedTask) Create(ctx context.Context, bundle string, opts runtime.CreateOpts) error {
 	if err := s.sandboxHandle.UpdateTasksExtension(ctx, func(ts *Tasks) error {
@@ -401,6 +419,9 @@ func (s *sandboxedTask) Exec(ctx context.Context, id string, opts runtime.ExecOp
 
 // Process wraps an existing exec process so sandbox metadata is updated when it is deleted.
 func (s *sandboxedTask) Process(ctx context.Context, id string) (runtime.ExecProcess, error) {
+	ctx, cancel := withRequestTimeout(ctx, taskStateTimeout)
+	defer cancel()
+
 	p, err := s.remoteTask.Process(ctx, id)
 	if err != nil {
 		return nil, err
@@ -415,6 +436,13 @@ func (s *sandboxedTask) Process(ctx context.Context, id string) (runtime.ExecPro
 type sandboxedProcess struct {
 	runtime.ExecProcess
 	task *sandboxedTask
+}
+
+func (p *sandboxedProcess) State(ctx context.Context) (runtime.State, error) {
+	ctx, cancel := withRequestTimeout(ctx, taskStateTimeout)
+	defer cancel()
+
+	return p.ExecProcess.State(ctx)
 }
 
 // Delete wrap the Delete of the process with sandbox update
@@ -433,6 +461,13 @@ func (p *sandboxedProcess) Delete(ctx context.Context) (*runtime.Exit, error) {
 		return nil, errgrpc.ToNative(err)
 	}
 	return exit, nil
+}
+
+func withRequestTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= timeout {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // UpdateTasksExtension update the extension of sandbox with the key "tasks"
