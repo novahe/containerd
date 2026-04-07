@@ -41,7 +41,7 @@ func ReadByteStream(ctx context.Context, stream streaming.Stream) io.ReadCloser 
 		ctx:     ctx,
 		stream:  stream,
 		window:  0,
-		errCh:   make(chan error),
+		errCh:   make(chan error, 1),
 		updated: make(chan struct{}, 1),
 	}
 	go func() {
@@ -59,13 +59,22 @@ func ReadByteStream(ctx context.Context, stream streaming.Stream) io.ReadCloser 
 			}
 			anyType, err := typeurl.MarshalAny(update)
 			if err != nil {
-				rbs.errCh <- err
+				select {
+				case rbs.errCh <- err:
+				default:
+				}
 				return
 			}
 			if err := stream.Send(anyType); err == nil {
 				rbs.window += windowSize
 			} else if !errors.Is(err, io.EOF) {
-				rbs.errCh <- err
+				select {
+				case rbs.errCh <- err:
+				default:
+				}
+				return
+			} else {
+				return
 			}
 		}
 

@@ -19,8 +19,10 @@ package streaming
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/streaming"
 	"github.com/containerd/typeurl/v2"
@@ -123,6 +125,28 @@ func TestSendReceiveEOFWithData(t *testing.T) {
 	}
 	if !bytes.Equal(expected, actual) {
 		t.Fatalf("received bytes are not equal\n\tactual: %v\n\texpected: %v", actual, expected)
+	}
+}
+
+func TestReadByteStreamReportErrorDoesNotBlock(t *testing.T) {
+	rbs := &readByteStream{
+		errCh: make(chan error, 1),
+	}
+	rbs.errCh <- io.ErrClosedPipe
+
+	done := make(chan struct{})
+	go func() {
+		select {
+		case rbs.errCh <- errors.New("second error"):
+		default:
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reportError blocked on a full error channel")
 	}
 }
 
