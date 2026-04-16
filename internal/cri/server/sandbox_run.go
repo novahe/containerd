@@ -51,6 +51,7 @@ func init() {
 // RunPodSandbox creates and starts a pod-level sandbox. Runtimes should ensure
 // the sandbox is in ready state.
 func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandboxRequest) (_ *runtime.RunPodSandboxResponse, retErr error) {
+	start := time.Now()
 	span := tracing.SpanFromContext(ctx)
 	config := r.GetConfig()
 	log.G(ctx).Debugf("Sandbox config %+v", config)
@@ -371,6 +372,8 @@ func (c *criService) RunPodSandbox(ctx context.Context, r *runtime.RunPodSandbox
 	c.generateAndSendContainerEvent(ctx, id, id, runtime.ContainerEventType_CONTAINER_STARTED_EVENT)
 
 	sandboxRuntimeCreateTimer.WithValues(labels["oci_runtime_type"]).UpdateSince(runtimeStart)
+
+	log.G(ctx).WithField("podsandboxid", id).Infof("nova: containerd run sandbox took %v", time.Since(start))
 
 	return &runtime.RunPodSandboxResponse{PodSandboxId: id}, nil
 }

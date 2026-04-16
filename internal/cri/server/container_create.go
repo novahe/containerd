@@ -56,6 +56,7 @@ func init() {
 
 // CreateContainer creates a new container in the given PodSandbox.
 func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateContainerRequest) (_ *runtime.CreateContainerResponse, retErr error) {
+	start := time.Now()
 	span := tracing.SpanFromContext(ctx)
 	config := r.GetConfig()
 	log.G(ctx).Debugf("Container config %+v", config)
@@ -198,6 +199,8 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	if err != nil {
 		return nil, err
 	}
+
+	log.G(ctx).WithField("podsandboxid", r.GetPodSandboxId()).Infof("nova: containerd create container took %v", time.Since(start))
 
 	return &runtime.CreateContainerResponse{ContainerId: id}, nil
 }
