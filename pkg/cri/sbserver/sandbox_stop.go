@@ -20,9 +20,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
+	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	sandboxstore "github.com/containerd/containerd/pkg/cri/store/sandbox"
@@ -52,6 +55,7 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 	// and container may still be created, so production should not rely on this behavior.
 	// TODO(random-liu): Introduce a state in sandbox to avoid future container creation.
 	stop := time.Now()
+	var stopContainerDeadlineExceeded error
 	containers := c.containerStore.List()
 	for _, container := range containers {
 		if container.SandboxID != id {
@@ -60,7 +64,12 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 		// Forcibly stop the container. Do not use `StopContainer`, because it introduces a race
 		// if a container is removed after list.
 		if err := c.stopContainer(ctx, container, 0); err != nil {
-			return fmt.Errorf("failed to stop container %q: %w", container.ID, err)
+			if !errdefs.IsDeadlineExceeded(err) || !c.isKuasarSandbox(sandbox) {
+				return fmt.Errorf("failed to stop container %q: %w", container.ID, err)
+			}
+			stopContainerDeadlineExceeded = fmt.Errorf("failed to stop container %q: %w", container.ID, err)
+			log.G(ctx).WithError(stopContainerDeadlineExceeded).Warnf("continue stopping sandbox %q after container stop deadline", id)
+			break
 		}
 	}
 
@@ -77,7 +86,14 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 			return fmt.Errorf("failed to get sandbox controller: %w", err)
 		}
 
-		if err := controller.Stop(ctx, id); err != nil {
+		stopCtx := ctx
+		var stopCancel context.CancelFunc
+		if stopContainerDeadlineExceeded != nil {
+			stopCtx, stopCancel = ctrdutil.DeferContext()
+			defer stopCancel()
+		}
+
+		if err := controller.Stop(stopCtx, id); err != nil {
 			return fmt.Errorf("failed to stop sandbox %q: %w", id, err)
 		}
 	}
@@ -111,6 +127,14 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 	log.G(ctx).Infof("TearDown network for sandbox %q successfully", id)
 
 	return nil
+}
+
+func (c *criService) isKuasarSandbox(sandbox sandboxstore.Sandbox) bool {
+	ociRuntime, err := c.getSandboxRuntime(sandbox.Config, sandbox.RuntimeHandler)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(ociRuntime.Type, "io.containerd.kuasar")
 }
 
 // waitSandboxStop waits for sandbox to be stopped until context is cancelled or

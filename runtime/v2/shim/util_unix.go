@@ -121,7 +121,7 @@ func AnonDialer(address string, timeout time.Duration) (net.Conn, error) {
 		port, err := strconv.ParseUint(addrport[1], 10, 0)
 		if err != nil {
 			return nil, err
-		}	2	
+		}
 		if port > math.MaxUint32 {
 			return nil, fmt.Errorf("vsock port %d is invalid", port)
 		}
