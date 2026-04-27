@@ -20,8 +20,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
+	ctrdutil "github.com/containerd/containerd/v2/internal/cri/util"
 	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/log"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -67,6 +69,7 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 	// TODO(random-liu): Introduce a state in sandbox to avoid future container creation.
 	span.AddEvent("stopping containers in the sandbox")
 	stop := time.Now()
+	var stopContainerDeadlineExceeded error
 	containers := c.containerStore.List()
 	for _, container := range containers {
 		if container.SandboxID != id {
@@ -75,14 +78,26 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 		// Forcibly stop the container. Do not use `StopContainer`, because it introduces a race
 		// if a container is removed after list.
 		if err := c.stopContainerRetryOnConnectionClosed(ctx, container, 0); err != nil {
-			return fmt.Errorf("failed to stop container %q: %w", container.ID, err)
+			if !errdefs.IsDeadlineExceeded(err) || !c.isKuasarSandbox(sandbox) {
+				return fmt.Errorf("failed to stop container %q: %w", container.ID, err)
+			}
+			stopContainerDeadlineExceeded = fmt.Errorf("failed to stop container %q: %w", container.ID, err)
+			log.G(ctx).WithError(stopContainerDeadlineExceeded).Warnf("continue stopping sandbox %q after container stop deadline", id)
+			break
 		}
 	}
 
 	// Only stop sandbox container when it's running or unknown.
 	state := sandbox.Status.Get().State
 	if state == sandboxstore.StateReady || state == sandboxstore.StateUnknown {
-		if err := c.sandboxService.StopSandbox(ctx, sandbox.Sandboxer, id); err != nil {
+		stopCtx := ctx
+		var stopCancel context.CancelFunc
+		if stopContainerDeadlineExceeded != nil {
+			stopCtx, stopCancel = ctrdutil.DeferContext()
+			defer stopCancel()
+		}
+
+		if err := c.sandboxService.StopSandbox(stopCtx, sandbox.Sandboxer, id); err != nil {
 			// Log and ignore the error if controller already removed the sandbox
 			if errdefs.IsNotFound(err) {
 				log.G(ctx).Warnf("sandbox %q is not found when stopping it", id)
@@ -136,6 +151,14 @@ func (c *criService) stopPodSandbox(ctx context.Context, sandbox sandboxstore.Sa
 		return fmt.Errorf("failed to cleanup image mounts for sandbox %q: %w", id, err)
 	}
 	return nil
+}
+
+func (c *criService) isKuasarSandbox(sandbox sandboxstore.Sandbox) bool {
+	ociRuntime, err := c.config.GetSandboxRuntime(sandbox.Config, sandbox.RuntimeHandler)
+	if err != nil {
+		return false
+	}
+	return strings.HasPrefix(ociRuntime.Type, "io.containerd.kuasar")
 }
 
 // waitSandboxStop waits for sandbox to be stopped until context is cancelled or
