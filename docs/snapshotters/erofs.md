@@ -106,9 +106,9 @@ apt command, and on Fedora it can be installed directly using the dnf command.
 
 ```bash
 # Debian/Ubuntu
-$ apt install erofs-utils
+apt install erofs-utils
 # Fedora
-$ dnf install erofs-utils
+dnf install erofs-utils
 ```
 
 Make sure that erofs-utils version is 1.7 or higher.
@@ -122,7 +122,7 @@ loaded with `modprobe erofs`.
 To check if the EROFS snapshotter is available, run the following command:
 
 ```bash
-$ ctr plugins ls | grep erofs
+ctr plugins ls | grep erofs
 ```
 
 The following message will be shown like below:
@@ -172,10 +172,10 @@ To run a container using the EROFS snapshotter, it needs to be explicitly
 specified:
 
 ```bash
-$ # ensure that the image we are using exists; it is a regular OCI image
-$ ctr image pull docker.io/library/busybox:latest
-$ # run the container with the provides snapshotter
-$ ctr run -rm -t --snapshotter erofs docker.io/library/busybox:latest hello sh
+# ensure that the image we are using exists; it is a regular OCI image
+ctr image pull docker.io/library/busybox:latest
+# run the container with the provides snapshotter
+ctr run -rm -t --snapshotter erofs docker.io/library/busybox:latest hello sh
 ```
 
 ## Quota Support
