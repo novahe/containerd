@@ -681,8 +681,7 @@ func WithUser(userstr string) SpecOpts {
 				return err
 			}
 
-			mounts = tryReadonlyMounts(mounts)
-			return mount.WithTempMount(ctx, mounts, f)
+			return tryFromOverlayLayers(ctx, mounts, f)
 		default:
 			return fmt.Errorf("invalid USER value %s", userstr)
 		}
@@ -742,8 +741,7 @@ func WithUserID(uid uint32) SpecOpts {
 			return err
 		}
 
-		mounts = tryReadonlyMounts(mounts)
-		return mount.WithTempMount(ctx, mounts, setUser)
+		return tryFromOverlayLayers(ctx, mounts, setUser)
 	}
 }
 
@@ -787,8 +785,7 @@ func WithUsername(username string) SpecOpts {
 				return err
 			}
 
-			mounts = tryReadonlyMounts(mounts)
-			return mount.WithTempMount(ctx, mounts, setUser)
+			return tryFromOverlayLayers(ctx, mounts, setUser)
 		} else if s.Windows != nil {
 			s.Process.User.Username = username
 		} else {
@@ -866,8 +863,7 @@ func WithAdditionalGIDs(userstr string) SpecOpts {
 			return err
 		}
 
-		mounts = tryReadonlyMounts(mounts)
-		return mount.WithTempMount(ctx, mounts, setAdditionalGids)
+		return tryFromOverlayLayers(ctx, mounts, setAdditionalGids)
 	}
 }
 
@@ -928,8 +924,7 @@ func WithAppendAdditionalGroups(groups ...string) SpecOpts {
 			return err
 		}
 
-		mounts = tryReadonlyMounts(mounts)
-		return mount.WithTempMount(ctx, mounts, setAdditionalGids)
+		return tryFromOverlayLayers(ctx, mounts, setAdditionalGids)
 	}
 }
 
@@ -1440,6 +1435,36 @@ func tryReadonlyMounts(mounts []mount.Mount) []mount.Mount {
 		mounts[0].Options = append(mounts[0].Options, "ro")
 	}
 	return mounts
+}
+
+// tryFromOverlayLayers attempts to call fn by directly resolving layer
+// directories from overlay mount options, avoiding the kernel mount/umount
+// syscalls entirely. If the mounts are not overlay/bind, or fn fails on
+// all layer dirs, it falls back to the original WithTempMount path.
+func tryFromOverlayLayers(ctx context.Context, mounts []mount.Mount, fn func(root string) error) error {
+	if len(mounts) > 0 {
+		m := mounts[0]
+		var dirs []string
+		switch m.Type {
+		case "bind":
+			dirs = []string{m.Source}
+		case "overlay":
+			for _, opt := range m.Options {
+				if strings.HasPrefix(opt, "lowerdir=") {
+					dirs = strings.Split(strings.TrimPrefix(opt, "lowerdir="), ":")
+					break
+				}
+			}
+		}
+		for _, dir := range dirs {
+			if err := fn(dir); err == nil {
+				return nil
+			}
+		}
+	}
+	// fallback: full kernel mount
+	mounts = tryReadonlyMounts(mounts)
+	return mount.WithTempMount(ctx, mounts, fn)
 }
 
 // WithWindowsDevice adds a device exposed to a Windows (WCOW or LCOW) Container
