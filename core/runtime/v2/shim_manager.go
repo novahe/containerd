@@ -194,6 +194,15 @@ func (m *ShimManager) ID() string {
 	return plugins.ShimPlugin.String() + ".manager"
 }
 
+func (m *ShimManager) PluginInfo(ctx context.Context, request any) (any, error) {
+	req, ok := request.(*apitypes.RuntimeRequest)
+	if !ok {
+		return nil, fmt.Errorf("unknown request type %T: %w", request, errdefs.ErrNotImplemented)
+	}
+
+	return getRuntimeInfo(ctx, m, req)
+}
+
 // Start launches a new shim instance
 func (m *ShimManager) Start(ctx context.Context, id string, bundle *Bundle, opts runtime.CreateOpts) (_ ShimInstance, retErr error) {
 	shouldInvokeShimBinary := false

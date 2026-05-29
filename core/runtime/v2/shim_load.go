@@ -22,107 +22,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/containerd/errdefs"
 	"github.com/containerd/log"
 
 	"github.com/containerd/containerd/v2/core/mount"
-	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/timeout"
-	"golang.org/x/sync/errgroup"
 )
-
-// LoadExistingShims loads existing shims from the path specified by stateDir
-// rootDir is for cleaning up the unused paths of removed shims.
-func (m *ShimManager) LoadExistingShims(ctx context.Context, stateDir string, rootDir string) error {
-	nsDirs, err := os.ReadDir(stateDir)
-	if err != nil {
-		return err
-	}
-	for _, nsd := range nsDirs {
-		if !nsd.IsDir() {
-			continue
-		}
-		ns := nsd.Name()
-		// skip hidden directories
-		if len(ns) > 0 && ns[0] == '.' {
-			continue
-		}
-		log.G(ctx).WithField("namespace", ns).Debug("loading tasks in namespace")
-		if err := m.loadShims(namespaces.WithNamespace(ctx, ns), stateDir); err != nil {
-			log.G(ctx).WithField("namespace", ns).WithError(err).Error("loading tasks in namespace")
-			continue
-		}
-		if err := m.cleanupWorkDirs(namespaces.WithNamespace(ctx, ns), rootDir); err != nil {
-			log.G(ctx).WithField("namespace", ns).WithError(err).Error("cleanup working directory in namespace")
-			continue
-		}
-	}
-	return nil
-}
-
-func (m *ShimManager) loadShims(ctx context.Context, stateDir string) error {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return err
-	}
-	ctx = log.WithLogger(ctx, log.G(ctx).WithField("namespace", ns))
-
-	shimDirs, err := os.ReadDir(filepath.Join(stateDir, ns))
-	if err != nil {
-		return err
-	}
-	eg, ctx2 := errgroup.WithContext(ctx)
-	eg.SetLimit(runtime.GOMAXPROCS(0))
-	var errLoad error
-	for _, sd := range shimDirs {
-		if !sd.IsDir() {
-			continue
-		}
-		id := sd.Name()
-		// skip hidden directories
-		if len(id) > 0 && id[0] == '.' {
-			continue
-		}
-		bundle, err := LoadBundle(ctx, stateDir, id)
-		if err != nil {
-			errLoad = err
-			// fine to return error here, it is a programmer error if the context
-			// does not have a namespace
-			break
-		}
-		eg.Go(func() error {
-			// fast path
-			f, err := os.Open(bundle.Path)
-			if err != nil {
-				bundle.Delete()
-				log.G(ctx2).WithError(err).Errorf("fast path read bundle path for %s", bundle.Path)
-				return nil
-			}
-
-			bf, err := f.Readdirnames(-1)
-			f.Close()
-			if err != nil {
-				bundle.Delete()
-				log.G(ctx2).WithError(err).Errorf("fast path read bundle path for %s", bundle.Path)
-				return nil
-			}
-			if len(bf) == 0 {
-				bundle.Delete()
-				return nil
-			}
-			if err := m.loadShim(ctx2, bundle); err != nil {
-				log.G(ctx2).WithError(err).Errorf("failed to load shim %s", bundle.Path)
-				bundle.Delete()
-				return nil
-			}
-			return nil
-		})
-	}
-	_ = eg.Wait()
-	return errLoad
-}
 
 func (m *ShimManager) loadShim(ctx context.Context, bundle *Bundle) error {
 	var (
@@ -237,38 +143,4 @@ func loadShimTask(ctx context.Context, bundle *Bundle, onClose func()) (_ *shimT
 		}
 	}
 	return s, nil
-}
-
-func (m *ShimManager) cleanupWorkDirs(ctx context.Context, rootDir string) error {
-	ns, err := namespaces.NamespaceRequired(ctx)
-	if err != nil {
-		return err
-	}
-
-	f, err := os.Open(filepath.Join(rootDir, ns))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-
-	dirs, err := f.Readdirnames(-1)
-	if err != nil {
-		return err
-	}
-
-	for _, dir := range dirs {
-		// if the task was not loaded, cleanup and empty working directory
-		// this can happen on a reboot where /run for the bundle state is cleaned up
-		// but that persistent working dir is left
-		if _, err := m.shims.Get(ctx, dir); err != nil {
-			path := filepath.Join(rootDir, ns, dir)
-			if err := os.RemoveAll(path); err != nil {
-				log.G(ctx).WithError(err).Errorf("cleanup working dir %s", path)
-			}
-		}
-	}
-	return nil
 }

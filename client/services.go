@@ -167,6 +167,13 @@ func WithSandboxStore(client sandbox.Store) ServicesOpt {
 	}
 }
 
+// WithSandboxControllers sets the sandbox controllers.
+func WithSandboxControllers(sandboxers map[string]sandbox.Controller) ServicesOpt {
+	return func(s *services) {
+		s.sandboxers = sandboxers
+	}
+}
+
 // WithTransferService sets the transfer service.
 func WithTransferService(tr transfer.Transferrer) ServicesOpt {
 	return func(s *services) {

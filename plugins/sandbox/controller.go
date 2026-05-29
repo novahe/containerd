@@ -77,10 +77,6 @@ func init() {
 				}
 			}
 
-			if err := shims.LoadExistingShims(ic.Context, state, root); err != nil {
-				return nil, fmt.Errorf("failed to load existing shim sandboxes, %v", err)
-			}
-
 			c := &controllerLocal{
 				root:      root,
 				state:     state,
